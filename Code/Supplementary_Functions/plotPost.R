@@ -1,8 +1,11 @@
-plotPost = function( paramSampleVec , cenTend=c("mode","median","mean")[1] , 
-                     compVal=NULL, ROPE=NULL, credMass=0.95, HDItextPlace=0.7, 
-                     xlab=NULL , xlim=NULL , yaxt=NULL , ylab=NULL , 
+## This function is taken from John Kruschke's book, Doing Bayesian Data Analysis, 2nd ed.
+## The functions in this book are available from his website: https://sites.google.com/site/doingbayesiandataanalysis/software-installation
+
+plotPost = function( paramSampleVec , cenTend=c("mode","median","mean")[1] ,
+                     compVal=NULL, ROPE=NULL, credMass=0.95, HDItextPlace=0.7,
+                     xlab=NULL , xlim=NULL , yaxt=NULL , ylab=NULL ,
                      main=NULL , cex=NULL , cex.lab=NULL ,
-                     col=NULL , border=NULL , showCurve=FALSE , breaks=NULL , 
+                     col=NULL , border=NULL , showCurve=FALSE , breaks=NULL ,
                      ... ) {
   # Override defaults of hist function, if not specified by user:
   # (additional arguments "..." are passed to the hist function)
@@ -15,32 +18,32 @@ plotPost = function( paramSampleVec , cenTend=c("mode","median","mean")[1] ,
   if ( is.null(ylab) ) ylab=""
   if ( is.null(col) ) col="skyblue"
   if ( is.null(border) ) border="white"
-  
+
   # convert coda object to matrix:
   if ( class(paramSampleVec) == "mcmc.list" ) {
     paramSampleVec = as.matrix(paramSampleVec)
   }
-  
+
   summaryColNames = c("ESS","mean","median","mode",
                       "hdiMass","hdiLow","hdiHigh",
                       "compVal","pGtCompVal",
                       "ROPElow","ROPEhigh","pLtROPE","pInROPE","pGtROPE")
-  postSummary = matrix( NA , nrow=1 , ncol=length(summaryColNames) , 
+  postSummary = matrix( NA , nrow=1 , ncol=length(summaryColNames) ,
                         dimnames=list( c( xlab ) , summaryColNames ) )
-  
+
   # require(coda) # for effectiveSize function
   postSummary[,"ESS"] = effectiveSize(paramSampleVec)
-  
+
   postSummary[,"mean"] = mean(paramSampleVec)
   postSummary[,"median"] = median(paramSampleVec)
   mcmcDensity = density(paramSampleVec)
   postSummary[,"mode"] = mcmcDensity$x[which.max(mcmcDensity$y)]
-  
+
   HDI = HDIofMCMC( paramSampleVec , credMass )
   postSummary[,"hdiMass"]=credMass
   postSummary[,"hdiLow"]=HDI[1]
   postSummary[,"hdiHigh"]=HDI[2]
-  
+
   # Plot histogram.
   cvCol = "darkgreen"
   ropeCol = "darkred"
@@ -76,27 +79,27 @@ plotPost = function( paramSampleVec , cenTend=c("mode","median","mean")[1] ,
   med = median(paramSampleVec)
   mcmcDensity = density(paramSampleVec)
   mo = mcmcDensity$x[which.max(mcmcDensity$y)]
-  if ( cenTend=="mode" ){ 
+  if ( cenTend=="mode" ){
     text( mo , cenTendHt ,
           bquote(mode==.(signif(mo,3))) , adj=c(.5,0) , cex=cex )
   }
-  if ( cenTend=="median" ){ 
+  if ( cenTend=="median" ){
     text( med , cenTendHt ,
           bquote(median==.(signif(med,3))) , adj=c(.5,0) , cex=cex , col=cvCol )
   }
-  if ( cenTend=="mean" ){ 
+  if ( cenTend=="mean" ){
     text( mn , cenTendHt ,
           bquote(mean==.(signif(mn,3))) , adj=c(.5,0) , cex=cex )
   }
   # Display the comparison value.
   if ( !is.null( compVal ) ) {
-    pGtCompVal = sum( paramSampleVec > compVal ) / length( paramSampleVec ) 
+    pGtCompVal = sum( paramSampleVec > compVal ) / length( paramSampleVec )
     pLtCompVal = 1 - pGtCompVal
-    lines( c(compVal,compVal) , c(0.96*cvHt,0) , 
+    lines( c(compVal,compVal) , c(0.96*cvHt,0) ,
            lty="dotted" , lwd=2 , col=cvCol )
     text( compVal , cvHt ,
           bquote( .(round(100*pLtCompVal,1)) * "% < " *
-                    .(signif(compVal,3)) * " < " * 
+                    .(signif(compVal,3)) * " < " *
                     .(round(100*pGtCompVal,1)) * "%" ) ,
           adj=c(pLtCompVal,0) , cex=0.8*cex , col=cvCol )
     postSummary[,"compVal"] = compVal
@@ -113,13 +116,13 @@ plotPost = function( paramSampleVec , cenTend=c("mode","median","mean")[1] ,
     lines( c(ROPE[2],ROPE[2]) , c(0.96*ROPEtextHt,0) , lty="dotted" , lwd=2 ,
            col=ropeCol)
     text( mean(ROPE) , ROPEtextHt ,
-          bquote( .(round(100*pLtROPE,1)) * "% < " * .(ROPE[1]) * " < " * 
-                    .(round(100*pInROPE,1)) * "% < " * .(ROPE[2]) * " < " * 
+          bquote( .(round(100*pLtROPE,1)) * "% < " * .(ROPE[1]) * " < " *
+                    .(round(100*pInROPE,1)) * "% < " * .(ROPE[2]) * " < " *
                     .(round(100*pGtROPE,1)) * "%" ) ,
           adj=c(pLtROPE+.5*pInROPE,0) , cex=1 , col=ropeCol )
-    
-    postSummary[,"ROPElow"]=ROPE[1] 
-    postSummary[,"ROPEhigh"]=ROPE[2] 
+
+    postSummary[,"ROPElow"]=ROPE[1]
+    postSummary[,"ROPEhigh"]=ROPE[2]
     postSummary[,"pLtROPE"]=pLtROPE
     postSummary[,"pInROPE"]=pInROPE
     postSummary[,"pGtROPE"]=pGtROPE

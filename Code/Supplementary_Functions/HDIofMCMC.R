@@ -1,3 +1,6 @@
+## This function is taken from John Kruschke's book, Doing Bayesian Data Analysis, 2nd ed.
+## The functions in this book are available from his website: https://sites.google.com/site/doingbayesiandataanalysis/software-installation
+
 HDIofMCMC = function( sampleVec , credMass=0.95 ) {
   # Computes highest density interval from a sample of representative values,
   #   estimated as shortest credible interval.
