@@ -1,0 +1,510 @@
+---
+title: "Prevalence analysis - Scale selection"
+author: "Dylan Simpson"
+date: "May 15, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T)
+library(R2jags)
+library(abind)
+library(tictoc)
+library(ggplot2)
+library(AICcmodavg)
+source("../Supplementary_Functions/HDIofMCMC.R")
+source("../Supplementary_Functions/plotPost.R")
+source("../Models/PrevalenceModel_modelSel.R")
+source("../Models/PrevalenceModel.R")
+source("../Supplementary_Functions/SupplementaryFunctions.R")
+source("../Supplementary_Functions/VIF.R")
+fieldData <- read.csv("../../data_in/Prevalence/Tick_PlotData.csv", header=T)
+landData <- read.csv("../../data_in/Prevalence/LandscapeMetrics.csv", header=T)
+```
+
+# Front matter
+Here I bring prepare the dataframes used in all subsequent analyses, and set up initial data arrays.
+
+```{r Data declaration}
+# Data need to be formated such that plots are indexed sequentially within each site, and years
+  ## are indexed sequentially within each plot.
+
+# Sites can retain character names, and the plotIndex and yearIndex functions will produce
+  ## functional indices for plot and year. However, note that these indexes need to remain
+  ## constant through all dataframes and arrays (i.e. site 1, plot 1 is always the same plot,
+  ## even if it is not surveyed every year). If one data frame has information for a plot or
+  ## survey not included in another, this will make the indices between frames incongruent!
+
+# After data declaration, all subsequent functions and chunks should run without amendment,
+  ## excepting, of course, the initial values and output parameters, which depend on the
+  ## model being run.
+
+# Standardize covariates:
+landData.scaled <- landData
+landData.scaled[3:ncol(landData.scaled)] <- apply(landData[3:ncol(landData.scaled)], 2, function(x) as.numeric(scale(x)))
+landData.scaled$plotID <- plotIndex(landData.scaled)
+
+fieldData$plotID <- plotIndex(fieldData)
+fieldData$obsID <- obsIndex(fieldData)
+fieldData$yearID <- yearIndex(fieldData)
+
+# Create list of meta data:
+dataLength <- datLength(fieldData)
+
+# Convert all input variables to arrays:
+y <- xtabs(ec ~ site + plotID + obsID + yearID, data = fieldData)
+n <- xtabs(nymphs ~ site + plotID + obsID + yearID, data = fieldData)
+
+cover.forest <- abind(xtabs(Cover_FRST_25 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_FRST_100 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_FRST_350 ~ site + plotID, data = landData.scaled),
+                     along = 3)
+
+cover.urban <- abind(xtabs(Cover_URB_25 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_URB_100 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_URB_350 ~ site + plotID, data = landData.scaled),
+                     along = 3)
+
+edge.forest <- abind(xtabs(Edge_FRST_25 ~ site + plotID, data = landData.scaled),
+                     xtabs(Edge_FRST_100 ~ site + plotID, data = landData.scaled),
+                     xtabs(Edge_FRST_350 ~ site + plotID, data = landData.scaled),
+                     along = 3)
+
+prox.forest <- abind(xtabs(PROX_FRST_25 ~ site + plotID, data = landData.scaled),
+                      xtabs(PROX_FRST_100 ~ site + plotID, data = landData.scaled),
+                      xtabs(PROX_FRST_350 ~ site + plotID, data = landData.scaled),
+                      along = 3)
+
+prop.eg <- abind(xtabs(Cover_EG_25 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_EG_100 ~ site + plotID, data = landData.scaled),
+                     xtabs(Cover_EG_350 ~ site + plotID, data = landData.scaled),
+                     along = 3)
+
+dist.water <- xtabs(Water_DIST ~ site + plotID, data = landData.scaled)
+```
+
+```{r Creating Year dummy variables}
+# To run prevalence model with year as a factor, the following creates dummy variables:
+
+fieldData$year.2012[fieldData$year!=2012] <- 0
+fieldData$year.2012[fieldData$year==2012] <- 1
+
+fieldData$year.2013[fieldData$year!=2013] <- 0
+fieldData$year.2013[fieldData$year==2013] <- 1
+
+fieldData$year.2015[fieldData$year!=2015] <- 0
+fieldData$year.2015[fieldData$year==2015] <- 1
+
+fieldData$year.2016[fieldData$year!=2016] <- 0
+fieldData$year.2016[fieldData$year==2016] <- 1
+
+fieldData$year.2017[fieldData$year!=2017] <- 0
+fieldData$year.2017[fieldData$year==2017] <- 1
+
+## Here it is important to factor year by yearID in order to match the dimensions with the beta vector
+## in order to take the dot product
+year.2012 <- xtabs(year.2012 ~ site + plotID + yearID, data = fieldData[fieldData$obsID==1,])
+year.2013 <- xtabs(year.2013 ~ site + plotID + yearID, data = fieldData[fieldData$obsID==1,])
+year.2015 <- xtabs(year.2015 ~ site + plotID + yearID, data = fieldData[fieldData$obsID==1,])
+year.2016 <- xtabs(year.2016 ~ site + plotID + yearID, data = fieldData[fieldData$obsID==1,])
+year.2017 <- xtabs(year.2017 ~ site + plotID + yearID, data = fieldData[fieldData$obsID==1,])
+
+year <- abind(year.2012, year.2013, year.2015, year.2016, year.2017, along = 4)
+nyear.max <- 5
+```
+
+# Model selection
+
+This first section uses a model-based model selection method, similar to that described by Stuber et al 2017, to simulataneously choose both scale and metric to describe land cover and fragmenation.
+
+
+```{r Data list for model selection}
+### Create data list:
+dataList.modSel <- list(
+  y = y,
+  prop.forest = cover.forest,
+  prop.urban = cover.urban,
+  edge.forest = edge.forest,
+  prox.forest = prox.forest,
+  prop.eg = prop.eg,
+  dist.water = dist.water,
+  n = n,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+```
+
+```{r Set up}
+params.modSel <- c('beta', 'beta.year', 'mu', 'sigma0', 'sigma', "I1", "I2")
+# Initialize a chain on the middle scale of each variable combo:
+inits.modSel <- lapply(c(2,5,8,11,14,17), function(x) list(I1 = x, I2 = sample(1:3,1)))
+```
+
+```{r Run model-selection}
+tic("Model run")
+prev.ModSel <- jags(data = dataList.modSel, 
+                inits = inits.modSel,
+                parameters.to.save = params.modSel, 
+                model.file = prev.modSel, 
+                n.chains = length(inits.modSel), 
+                n.iter = 102000, 
+                n.burnin = 12000,
+                n.thin = 15)
+toc()
+prev.modSel.mcmc <- as.mcmc(prev.ModSel) # save as coda object, req'd for useful functions
+prev.modSel.mat <- as.matrix( prev.modSel.mcmc) # convert to matrix and data frame for plotting
+prev.modSel.dat <- data.frame(prev.modSel.mat)
+```
+
+```{r JAGS diagnostics}
+traceplot(prev.modSel.mcmc)
+```
+
+```{r Model selection - Results}
+barplot(table(prev.modSel.dat$I1), ylim = c(0,20000), xlab = "Indicator value", ylab = "Number of inclusions")
+barplot(table(prev.modSel.dat$I2), ylim = c(0,28000), xlab = "Indicator value", ylab = "Number of inclusions")
+postPlot.batch(prev.modSel.dat)
+```
+
+
+# Global model
+## Analysis
+```{r Set up for global model}
+# Define interaction term for easy inclusion with other variables:
+forest.coverXedge <- cover.forest*edge.forest
+
+# Define covariate array:
+X.global <- abind(cover.forest[,,3], edge.forest[,,3], forest.coverXedge[,,3], prop.eg[,,2], dist.water, along = 3)
+
+nbetas.global = tail(dim(X.global), n = 1)
+
+
+inits1 <- list(
+    beta = replicate(nbetas.global, rnorm(1, sd=.5)),
+    mu.raw = qlogis(.01),
+    sigma = .5,
+    sigma0 = .5
+  )
+inits2 <- list(
+    beta = replicate(nbetas.global, rnorm(1, sd=.5)),
+    mu.raw = qlogis(.05),
+    sigma = 2,
+    sigma0 = 2
+  )
+
+inits3 <- list(
+    beta = replicate(nbetas.global, rnorm(1, sd=.5)),
+    mu.raw = qlogis(.1),
+    sigma = 5,
+    sigma0 = 5
+  )
+
+inits.global <- list(inits1, inits2, inits3
+              )
+
+params.global <- c(
+            'mu',
+            'beta',
+            'beta.year',
+            'sigma',
+            'sigma0'
+            )
+
+
+dataList.global <- list(
+  y = y,
+  X = X.global,
+  n = n,
+  nbetas = nbetas.global,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+```
+
+
+```{r Run global model}
+tic("Global model")
+prevMod.global <- jags(data = dataList.global, 
+                inits = inits.global,
+                parameters.to.save = params.global, 
+                model.file = prevalence, 
+                n.chains = length(inits.global),
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+toc()
+prevMod.global.mcmc <- as.mcmc(prevMod.global) # save as coda object, req'd for useful functions
+prevMat.global <- as.matrix(prevMod.global.mcmc) # convert to matrix and data frame for plotting
+modDat.global <- data.frame(prevMat.global)
+```
+
+## Results
+
+```{r JAGS diagnostics}
+traceplot(prevMod.global.mcmc)
+```
+
+```{r Results}
+postPlot.batch(modDat.global)
+# postPlot.batchPrint(modDat.global, mod = "Global")
+```
+
+```{r Global model summary stats}
+annual.prev <- data.frame(
+  prev.2012 = plogis(modDat.global$mu + modDat.global$beta.year.1.)*100,
+  prev.2013 = plogis(modDat.global$mu + modDat.global$beta.year.2.)*100,
+  prev.2015 = plogis(modDat.global$mu + modDat.global$beta.year.3.)*100,
+  prev.2016 = plogis(modDat.global$mu + modDat.global$beta.year.4.)*100,
+  prev.2017 = plogis(modDat.global$mu + modDat.global$beta.year.5.)*100
+)
+
+lapply(annual.prev, mean)
+
+lapply(modDat.global, mean)
+
+```
+
+# Dealing with collinearity
+Here, it is important to note that some of the variables in the above model are highly correlated, especially forest cover and edge. This is important because there is no evidence for an interaction and so we need to ask whether it is appropriate to include these variables in one model. I address this below in two ways. First, I calculate variance inflation factors (Zuur et al. 2009). Second, I run four new models in which I separate forest cover and edge (i.e. two models with either one or the other) or regress them against one another and include one as the residuals of that regresion (i.e. one variable un-modified and one residual, and vice versa), then compare these models to the global model via the deviance information criterion (DIC). If effects seen in the global model are artifcats of collinearity, they should not reduce the DIC.
+
+## Variance inflation factors
+
+```{r VIF}
+landData.used <- cbind(landData.scaled$Cover_FRST_350, landData.scaled$Edge_FRST_350, landData.scaled$Cover_EG_100, landData.scaled$Water_DIST)
+
+corvif(landData.used)
+```
+
+## Follow-up models
+### Single-variable models
+
+Here I run forest cover and edge individually to compare the beta posteriors to those in the global model:
+
+```{r Prepare single variable models}
+cover <- abind(cover.forest[,,3], prop.eg[,,2], dist.water, along = 3)
+edge <- abind(edge.forest[,,3], prop.eg[,,2], dist.water, along = 3)
+
+inits1 <- list(
+    beta = replicate(3, rnorm(1, sd=.5)),
+    mu.raw = rnorm(1, mean = qlogis(0.018), sd=.5),
+    sigma = runif(1,0,10),
+    sigma0 = runif(1,0,10)
+  )
+inits2 <- list(
+    beta = replicate(3, rnorm(1, sd=.5)),
+    mu.raw = rnorm(1, mean = qlogis(0.018), sd=.5),
+    sigma = runif(1,0,10),
+    sigma0 = runif(1,0,10)
+  )
+
+inits3 <- list(
+    beta = replicate(3, rnorm(1, sd=.5)),
+    mu.raw = rnorm(1, mean = qlogis(0.018), sd=.5),
+    sigma = runif(1,0,10),
+    sigma0 = runif(1,0,10)
+  )
+
+inits.singles <- list(inits1, inits2, inits3
+              )
+
+params.singles <- c(
+            'mu',
+            'beta',
+            'beta.year',
+            'sigma',
+            'sigma0'
+            )
+
+
+dataList.cover <- list(
+  y = y,
+  X = cover,
+  n = n,
+  nbetas = 3,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+
+dataList.edge <- list(
+  y = y,
+  X = edge,
+  n = n,
+  nbetas = 3,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+```
+
+```{r Run single variable models}
+tic("Cover model")
+prevMod.cover <- jags(data = dataList.cover, 
+                inits = inits.singles,
+                parameters.to.save = params.singles, 
+                model.file = prevalence, 
+                n.chains = length(inits.singles),
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+toc()
+prevMod.cover.mcmc <- as.mcmc(prevMod.cover) # save as coda object, req'd for useful functions
+prevMat.cover <- as.matrix(prevMod.cover.mcmc) # convert to matrix and data frame for plotting
+modDat.cover <- data.frame(prevMat.cover)
+
+tic("Edge model")
+prevMod.edge <- jags(data = dataList.edge, 
+                inits = inits.singles,
+                parameters.to.save = params.singles, 
+                model.file = prevalence, 
+                n.chains = length(inits.singles),
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+toc()
+prevMod.edge.mcmc <- as.mcmc(prevMod.edge) # save as coda object, req'd for useful functions
+prevMat.edge <- as.matrix(prevMod.edge.mcmc) # convert to matrix and data frame for plotting
+modDat.edge <- data.frame(prevMat.edge)
+```
+
+```{r JAGS diagnostics}
+traceplot(prevMod.cover.mcmc)
+traceplot(prevMod.edge.mcmc)
+```
+
+```{r Results}
+postPlot.batch(modDat.cover, mod = 'Forest Cover')
+# postPlot.batchPrint(modDat.cover, mod = "Forest cover")
+
+postPlot.batch(modDat.edge, mod = "Edge")
+# postPlot.batchPrint(modDat.edge, mod = "Edge")
+```
+
+```{r Singles summary stats}
+lapply(modDat.cover, mean)
+lapply(modDat.edge, mean)
+```
+
+## Residual models
+
+```{r Data prep}
+# Regression to remove collinearity, keeping forest cover as main effect:
+coverVedge.lm <- lm(landData.scaled$Edge_FRST_350 ~ landData.scaled$Cover_FRST_350)
+landData.scaled$edgeRes <- as.numeric(scale(coverVedge.lm$residuals))
+# For peach of mind
+plot(landData.scaled$Cover_FRST_350, landData.scaled$edgeRes)
+cor(landData.scaled$Cover_FRST_350, landData.scaled$edgeRes)
+
+# Regression to remove collinearity, keeping forest edge as main effect:
+edgeVcover.lm <- lm(landData.scaled$Cover_FRST_350 ~ landData.scaled$Edge_FRST_350)
+landData.scaled$coverRes <- as.numeric(scale(edgeVcover.lm$residuals))
+# For peach of mind
+plot(landData.scaled$Edge_FRST_350, landData.scaled$coverRes)
+cor(landData.scaled$Edge_FRST_350, landData.scaled$coverRes)
+
+# Coerce these data into a site by plot array:
+edgeRes <- xtabs(edgeRes ~ site + plotID, data = landData.scaled)
+coverRes <- xtabs(coverRes ~ site + plotID, data = landData.scaled)
+# Create interaction variable
+coverXres <- cover.forest[,,3] * edgeRes
+edgeXres <- edge.forest[,,3] * coverRes
+```
+
+```{r Data declaration}
+# Exept for creating a new X vector, all the settings can be retained from the orginal global model.
+X.global.2 <- abind(cover.forest[,,3], edgeRes, coverXres, prop.eg[,,2], dist.water, along = 3)
+X.global.3 <- abind(edge.forest[,,3], coverRes, edgeXres, prop.eg[,,2], dist.water, along = 3)
+
+dataList.global.2 <- list(
+  y = y,
+  X = X.global.2,
+  n = n,
+  nbetas = nbetas.global,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+dataList.global.3 <- list(
+  y = y,
+  X = X.global.3,
+  n = n,
+  nbetas = nbetas.global,
+  nsite = dataLength$nsite,
+  nplot = dataLength$nplot,
+  nobs = dataLength$nobs,
+  nyear = dataLength$nyear,
+  year = year,
+  nyear.max = nyear.max
+)
+```
+
+```{r Run global.2}
+tic("global.2 model")
+prevMod.global.2 <- jags(data = dataList.global.2, 
+                inits = inits.global,
+                parameters.to.save = params.global, 
+                model.file = prevalence, 
+                n.chains = length(inits.global),
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+toc()
+prevMod.global2.mcmc <- as.mcmc(prevMod.global.2) # save as coda object, req'd for useful functions
+prevMat.global2 <- as.matrix(prevMod.global2.mcmc) # convert to matrix and data frame for plotting
+modDat.global2 <- data.frame(prevMat.global2)
+```
+
+```{r Run global.3}
+tic("global.3 model")
+prevMod.global.3 <- jags(data = dataList.global.3, 
+                inits = inits.global,
+                parameters.to.save = params.global, 
+                model.file = prevalence, 
+                n.chains = length(inits.global),
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+toc()
+prevMod.global3.mcmc <- as.mcmc(prevMod.global.3) # save as coda object, req'd for useful functions
+prevMat.global3 <- as.matrix(prevMod.global3.mcmc) # convert to matrix and data frame for plotting
+modDat.global3 <- data.frame(prevMat.global3)
+```
+
+```{r global.2/3 diagnostics}
+traceplot(prevMod.global2.mcmc)
+traceplot(prevMod.global3.mcmc)
+```
+
+```{r global.2 posterior plots}
+postPlot.batch(modDat.global2)
+postPlot.batch(modDat.global3)
+```
+
+### Model comparison
+
+```{r DIC comparison}
+dictab(list(
+  "Global" = prevMod.global,
+  "Cover + EdgeRes" = prevMod.global.2,
+  "Edge + CoverRes" = prevMod.global.3,
+  "Cover" = prevMod.cover,
+  "Edge" = prevMod.edge
+), return.pD = T)
+```

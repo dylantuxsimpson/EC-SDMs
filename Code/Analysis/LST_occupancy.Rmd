@@ -1,0 +1,287 @@
+---
+title: "Tick occupancy analyses"
+author: "Dylan Simpson"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(R2jags)
+library(abind)
+library(mcmcse)
+library(ggplot2)
+library(mcmcse)
+source("../Supplementary_Functions/SupplementaryFunctions.R")
+source("../Supplementary_Functions/HDIofMCMC.R")
+source("../Supplementary_Functions/plotPost.R")
+source("../Models/OccupancyModel_Multiseason.R")
+source("../Models/OccupancyModel_MS_modelSelection.R")
+```
+
+# Set up
+
+```{r Declaring data}
+obs.dat <- read.csv("../../data_in/Occupancy/TickObs_2012-2017.csv")
+weather.dat <- read.csv("../../data_in/Occupancy/WeatherData_2012-2017.csv")
+land.dat <- read.csv("../../data_in/Occupancy/LandscapeMetrics_5yrSubset.csv")
+
+land.dat[,3:ncol(land.dat)] <- as.numeric(scale(land.dat[,3:ncol(land.dat)]))
+weather.dat[,5] <- as.numeric(scale(weather.dat[,5]))
+
+# plotIndex and obsIndex are functions I wrote to create proper indices to coerce these data into arrays for JAGS
+obs.dat$plotID <- plotIndex(obs.dat)
+obs.dat$obsID <- obsIndex(obs.dat)
+obs.dat$yearID <- as.numeric(as.factor(obs.dat$year))
+
+land.dat$plotID <- plotIndex(land.dat)
+
+weather.dat$plotID <- plotIndex(weather.dat)
+weather.dat$yearID <- as.numeric(as.factor(weather.dat$year))
+
+dataLength <- datLength(obs.dat)
+nyear <- 5
+yearsObs = c(2,3,5,6,7)
+yearsUnobs = c(1,4)
+```
+
+```{r Defining variables}
+obs <- xtabs(tick ~ site + plotID + obsID + yearID, data = obs.dat)
+obs.array <- array(NA, dim = dim(obs)[1:3])
+obs <- abind(obs.array, obs[,,,1:2], obs.array, obs[,,,3:5])
+
+cover.forest <- abind(xtabs(Cover_FRST_25 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_FRST_100 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_FRST_350 ~ site + plotID, data = land.dat),
+                     along = 3)
+
+cover.urban <- abind(xtabs(Cover_URB_25 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_URB_100 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_URB_350 ~ site + plotID, data = land.dat),
+                     along = 3)
+
+edge.forest <- abind(xtabs(Edge_FRST_25 ~ site + plotID, data = land.dat),
+                     xtabs(Edge_FRST_100 ~ site + plotID, data = land.dat),
+                     xtabs(Edge_FRST_350 ~ site + plotID, data = land.dat),
+                     along = 3)
+
+prox.forest <- abind(xtabs(PROX_FRST_25 ~ site + plotID, data = land.dat),
+                      xtabs(PROX_FRST_100 ~ site + plotID, data = land.dat),
+                      xtabs(PROX_FRST_350 ~ site + plotID, data = land.dat),
+                      along = 3)
+
+prop.eg <- abind(xtabs(Cover_EG_25 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_EG_100 ~ site + plotID, data = land.dat),
+                     xtabs(Cover_EG_350 ~ site + plotID, data = land.dat),
+                     along = 3)
+
+dist.water <- xtabs(Water_DIST ~ site + plotID, data = land.dat)
+
+## data for detection needs to be placed in time-explicit arrays:
+temp <- xtabs(temp ~ site + plotID + yearID, data=weather.dat)
+plot.array <- array(NA, dim = dim(temp)[1:2])
+temp <- abind(plot.array, temp[,,1:2], plot.array, temp[,,3:5], along = 3)
+
+slope <- xtabs(slope ~ site + plotID, data = land.dat)
+slope <- abind(replicate(nyear, slope), along = 3)
+slope <- abind(plot.array, slope[,,1:2], plot.array, slope[,,3:5], along = 3)
+
+X.p <- abind(temp, slope, along = 4)
+nbeta.p <- tail(dim(X.p), n = 1)
+nbeta.e <- 5
+nbeta.g <- 5
+
+zinit <- array(NA, dim=c(dim(obs)[1], dim(obs)[2], dim(obs)[4]))
+
+for(i in 1:dataLength$nsite){
+    for(j in 1:dataLength$nplot[i]){
+      for(t in yearsObs){
+        zinit[i,j,t] <- 1
+      }
+    }
+}
+```
+
+# Model/scale selection
+
+```{r Model/scale selection}
+dataList.modSel <- list(
+  obs = obs,
+  nsites = dataLength$nsite,
+  nplots = dataLength$nplot,
+  nobs = 4,
+  prop.forest = cover.forest,
+  prop.urban = cover.urban,
+  edge.forest = edge.forest,
+  prox.forest = prox.forest,
+  prop.eg = prop.eg,
+  dist.water = dist.water,
+  X.p = X.p,
+  yearsObs = yearsObs
+)
+
+inits1 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = 7, sigma.g = 7, sigma.p = 7,
+  ie1 = sample(1:12, 1), ie2 = sample(1:3, 1),
+  ig1 = sample(1:12, 1), ig2 = sample(1:3, 1),
+  z = zinit
+)
+
+inits2 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = 4, sigma.g = 4, sigma.p = 4,
+  ie1 = sample(1:12, 1), ie2 = sample(1:3, 1),
+  ig1 = sample(1:12, 1), ig2 = sample(1:3, 1),
+  z = zinit
+)
+
+inits3 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = 1, sigma.g = 1, sigma.p = 1,
+  ie1 = sample(1:12, 1), ie2 = sample(1:3, 1),
+  ig1 = sample(1:12, 1), ig2 = sample(1:3, 1),
+  z = zinit
+)
+
+inits.modSel <- list(inits1, inits2, inits3
+              )
+
+params.modSel <- c(
+  "alpha.e", "alpha.g", "alpha.p", 
+  "beta.eps", "beta.gam", "beta.p",
+  "sigma.e", "sigma.g", "sigma.p",
+  "det.error", "ie1", "ie2", "ig1", "ig2"
+  )
+```
+
+```{r JAGS - run the model}
+OccMod <- jags(data = dataList.modSel, 
+                inits = inits.modSel,
+                parameters.to.save = params.modSel, 
+                model.file = occuMS.modSel, 
+                n.chains = length(inits.modSel), 
+                n.iter = 250000, 
+                n.burnin = 10000,
+                n.thin = 20)
+OccMod.modSel.mcmc <- as.mcmc(OccMod)
+OccMat.modSel <- as.matrix(OccMod.modSel.mcmc)
+OccDat.modSel <- data.frame(OccMat.modSel)
+```
+
+```{r Assessment}
+traceplot(OccMod.modSel.mcmc)
+multiESS(OccMat.modSel)
+```
+
+```{r Results}
+# postPlot.batch(OccDat.modSel)
+barplot(table(OccDat.modSel$ie1), main = "Forest cover and fragmentation - epsilon")
+barplot(table(OccDat.modSel$ie2), main = "Proportion evergreen - epsilon")
+
+barplot(table(OccDat.modSel$ig1), main = "Forest cover and fragmentation - gamma")
+barplot(table(OccDat.modSel$ig2), main = "Proportion evergreen - gamma")
+
+
+```
+
+After initially running the full global model, I found that mixing was very poor in beta.temp and alpha.p. Removing temperature as a covariate improved model performance (i.e. mixing and ESS), but did not cause any qualitative changes to other parameters in the model (i.e. no sign flippage or substantial change in effect sizes). I include temperature here so its posterior can demonstrate its lack of importance.
+
+# Global model:
+```{r Global model}
+habFrag.eps <- cover.forest * edge.forest
+habFrag.gam <- cover.forest * prox.forest
+X.e <- abind(cover.forest[,,1], edge.forest[,,1], habFrag.eps[,,1], prop.eg[,,3], dist.water, along = 3)
+X.g <- abind(cover.forest[,,3], prox.forest[,,3], habFrag.gam[,,3], prop.eg[,,3], dist.water,  along = 3)
+X.p <- abind(temp, slope, along = 4)
+
+nbeta.p = tail(dim(X.p), n = 1)
+nbeta.g = tail(dim(X.g), n = 1)
+nbeta.e = tail(dim(X.e), n = 1)
+
+dataList.global <- list(
+  obs = obs,
+  nsites = dataLength$nsite,
+  nplots = dataLength$nplot,
+  nobs = 4,
+  X.g = X.g,
+  X.e = X.e,
+  X.p = X.p,
+  nbeta.p = nbeta.p,
+  nbeta.g = nbeta.g,
+  nbeta.e = nbeta.e,
+  yearsObs = yearsObs
+)
+
+inits1 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = runif(1, 0,10), sigma.g = runif(1, 0,10),
+  sigma.p = runif(1, 0,10), det.error = runif(1, 0,10),
+  z = zinit
+)
+
+inits2 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = runif(1, 0,10), sigma.g = runif(1, 0,10),
+  sigma.p = runif(1, 0,10), det.error = runif(1, 0,10),
+  z = zinit
+)
+
+inits3 <- list(
+  alpha.e = rnorm(1), alpha.g = rnorm(1), alpha.p = rnorm(1),
+  beta.eps = rnorm(nbeta.e), beta.gam =  rnorm(nbeta.g),
+  beta.p = rnorm(nbeta.p),
+  sigma.e = runif(1, 0,10), sigma.g = runif(1, 0,10),
+  sigma.p = runif(1, 0,10), det.error = runif(1, 0,10),
+  z = zinit
+)
+
+inits.global <- list(inits1, inits2, inits3
+              )
+
+params.global <- c(
+  "alpha.e", "alpha.g", "alpha.p", 
+  "beta.eps", "beta.gam", "beta.p",
+  "sigma.e", "sigma.g",
+  "sigma.p",
+  "det.error"
+  )
+```
+
+```{r JAGS - run the model}
+OccMod <- jags(data = dataList.global, 
+                inits = inits.global,
+                parameters.to.save = params.global, 
+                model.file = occuMS.hier.missYear, 
+                n.chains = length(inits.global), 
+                n.iter = 110000, 
+                n.burnin = 10000,
+                n.thin = 10)
+OccMod.mcmc.global <- as.mcmc(OccMod)
+OccMat.global <- as.matrix(OccMod.mcmc.global)
+OccDat.global <- data.frame(OccMat.global)
+```
+
+```{r Assessment}
+traceplot(OccMod.mcmc.global)
+gelman.diag(OccMod.mcmc.global)
+multiESS(OccMat.global)
+```
+
+```{r Results}
+postPlot.batch(OccDat.global)
+# postPlot.batchPrint(OccDat.global)
+```
+
+```{r Results summary}
+lapply(OccDat.global, dat.sum)
+```
